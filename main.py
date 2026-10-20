@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from laya import Router
 import logging
 
+logger = logging.getLogger("uvicorn.error")
 app = FastAPI()
 class DocumentModel(BaseModel):
     title: str
@@ -157,3 +158,64 @@ def hybrid_search(request_data: SearchRequest):
         })
     
     return results
+
+@app.post("/convesational-search")
+def generate_answer(request_data: SearchRequest):
+    query = request_data.query
+    k = request_data.k
+    #check cache
+    #laya will check do we need to call llm or not?
+    should_call_llm = classify_query(query)
+    logging.warning(f"Query: {query}, Should call LLM: {should_call_llm}")
+    if should_call_llm:
+        # Perform hybrid search
+        search_results = hybrid_search(SearchRequest(query=query, k=5))
+        
+        # Format the context from search results
+        context = "\n".join([
+            f"Title: {r['title']}\nDescription: {r['description']}\nBody: {r['body']}\n"
+            for r in search_results
+        ])
+        
+        # Generate answer using LLM
+        #prompt builder check guardrails
+        response = open_router_client.chat.completions.create(
+            model=llm_model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"Use the following context to answer the query:\n\nContext:\n{context}\n\nQuery: {query}"}
+            ]
+        )
+        
+        answer = response.choices[0].message.content
+        return {"answer": answer, "sources": search_results}
+    else:
+        return hybrid_search(SearchRequest(query=query))
+    
+
+
+
+router = Router(preload=True)
+
+classifier_questions = {
+    "should_we_call_llm": {
+        "type": "noul",
+        "instructions": "Does this user query require calling a large language model? Return true ONLY for genuine questions, complex requests, or queries needing explanation. Return false for greetings (hello, hi, how are you), single words, simple acknowledgements, or anything that is not a real question."
+    }
+}
+
+
+def classify_query(query: str) -> bool:
+    state_context = {
+        "user_query": query,
+        "instruction": (
+            "Decide whether this user query requires calling a large language model "
+            "to generate a meaningful answer. Return true if the query is a real question, "
+            "a complex request, or needs explanation. Return false if it is a single word, "
+            "a greeting, a simple acknowledgement, or does not need an AI-generated answer."
+        )
+    }
+    results = router.predict(state=state_context, questions=classifier_questions)
+    noul_score = results.get("answers", {}).get("should_we_call_llm", {}).get("noul", 1.0)
+    logging.warning(f"Query: {query}, noul_score: {noul_score}")
+    return noul_score >= 0.80
