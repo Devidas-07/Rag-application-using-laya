@@ -164,6 +164,10 @@ def generate_answer(request_data: SearchRequest):
     query = request_data.query
     k = request_data.k
     #check cache
+    cached_result = check_cache(query)
+    if cached_result:
+        logging.warning("cache result found")
+        return cached_result
     #laya will check do we need to call llm or not?
     should_call_llm = classify_query(query)
     logging.warning(f"Query: {query}, Should call LLM: {should_call_llm}")
@@ -179,17 +183,28 @@ def generate_answer(request_data: SearchRequest):
         
         # Generate answer using LLM
         #prompt builder check guardrails
-        response = open_router_client.chat.completions.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": f"Use the following context to answer the query:\n\nContext:\n{context}\n\nQuery: {query}"}
-            ]
-        )
+        harmful_content = is_harmful_input(query)
+        if harmful_content:
+            return {"sorry we can't poceed with harmful query"}
+        else:
+            logging.warning(f"No harmful content")
+            response = open_router_client.chat.completions.create(
+                model=llm_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": f"Use the following context to answer the query:\n\nContext:\n{context}\n\nQuery: {query}"}
+                ]
+            )
         
         answer = response.choices[0].message.content
-        return {"answer": answer, "sources": search_results}
+        if answer is not None:
+            logging.warning(f"saving response in cache")
+            save_to_cache(query, answer)
+            return {"answer": answer, "sources": search_results}
+        else:
+            return {"error": "Failed to generate an answer."}
     else:
+        logging.warning(f"calling hybrid search")
         return hybrid_search(SearchRequest(query=query))
     
 
@@ -201,6 +216,15 @@ classifier_questions = {
     "should_we_call_llm": {
         "type": "noul",
         "instructions": "Does this user query require calling a large language model? Return true ONLY for genuine questions, complex requests, or queries needing explanation. Return false for greetings (hello, hi, how are you), single words, simple acknowledgements, or anything that is not a real question."
+    }
+}
+
+is_harmful_question = {
+    "is_harful_query": {
+        
+        "type": "noul",
+        "instructions": "Is this query potentially harmful, offensive, or outside the scope of helpful responses? Return true for any query that could be harmful, inappropriate, or unrelated to the intended use case. does it contain any forbidden content?"
+
     }
 }
 
@@ -219,3 +243,49 @@ def classify_query(query: str) -> bool:
     noul_score = results.get("answers", {}).get("should_we_call_llm", {}).get("noul", 1.0)
     logging.warning(f"Query: {query}, noul_score: {noul_score}")
     return noul_score >= 0.80
+
+def is_harmful_input(query:str) -> bool:
+    #check guardrails using laya decision model
+    state_context = {
+        "user_query": query,
+        "instruction": (
+           "Decide whether this user query contain any harmful content"
+        )
+    }
+    results = router.predict(state=state_context, questions=classifier_questions)
+    noul_score = results.get("answers", {}).get("should_we_call_llm", {}).get("noul", 1.0)
+    logging.warning(f"Query: {query}, noul_score: {noul_score}")
+    return noul_score >= 0.80
+
+def check_cache(query:str):
+    cache_index = os.getenv("es_cache_index")
+    search_body ={
+        "query": {
+            "term": {
+            "query.keyword": {
+                "value": query
+            }
+            }
+        }
+    }
+    es_result = es_client.search(index=cache_index, body= search_body)
+    results = []
+    for hit in es_result['hits']['hits']:
+        results.append({
+            "id": hit['_source'].get('id', ''),
+            "result": hit['_source'].get('answer', '')
+        })
+    
+    return results
+
+def save_to_cache(query:str, answer:str):
+    cache_index = os.getenv("es_cache_index")
+    doc_id = str(uuid.uuid4())
+    es_payload = {
+        "id": doc_id,
+        "query": query,
+        "answer": answer
+    }
+    result = es_client.index(index=cache_index, id=doc_id, document=es_payload)
+    return result
+
