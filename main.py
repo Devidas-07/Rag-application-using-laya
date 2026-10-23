@@ -7,8 +7,10 @@ import uuid
 from pydantic import BaseModel
 from laya import Router
 import logging
+import re
+from typing import Optional
 
-logger = logging.getLogger("uvicorn.error")
+logger = logging.getLogger(__name__)
 app = FastAPI()
 class DocumentModel(BaseModel):
     title: str
@@ -192,14 +194,14 @@ def generate_answer(request_data: SearchRequest):
                 model=llm_model,
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": f"Use the following context to answer the query:\n\nContext:\n{context}\n\nQuery: {query}"}
+                    {"role": "user", "content": f"Use the following context to answer the query:\n\nContext:\n{context}\n\nQuery: {query} give answer in only 5 to 6 lines. If you don't have context then directly say I don't have enough information so I can not generate answer"}
                 ]
             )
         
         answer = response.choices[0].message.content
         if answer is not None:
             logging.warning(f"saving response in cache")
-            save_to_cache(query, answer)
+            save_to_cache(query, answer, search_results)
             return {"answer": answer, "sources": search_results}
         else:
             return {"error": "Failed to generate an answer."}
@@ -228,22 +230,78 @@ is_harmful_question = {
     }
 }
 
+# Call the LLM unless the classifier is fairly sure it is NOT needed.
+LLM_THRESHOLD = 0.35          # tune on your own logged data
+MAX_QUERY_CHARS = 1500        # Laya's context is limited, so truncate
 
-def classify_query(query: str) -> bool:
+# Messages that are purely social: full-match only, so "hi, what is your refund policy?" is NOT skipped.
+_SOCIAL_ONLY = re.compile(
+    r"^\s*(hi+|hello+|hey+|hii+|yo|namaste|namaskar|good\s+(morning|afternoon|evening|night)|"
+    r"thanks?(\s+you)?|thank\s*u|thx|ok(ay)?|k|cool|great|nice|got\s*it|sure|"
+    r"bye|goodbye|see\s+you|"
+    r"[\U0001F44D\U0001F64F\U0001F60A\U0001F642\u2705]+)"
+    r"[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+_QUESTION_START = re.compile(
+    r"^\s*(what|why|how|when|where|who|which|whom|can|could|should|would|will|do|does|did|"
+    r"is|are|was|were|explain|describe|compare|summari[sz]e|list|show|give|tell|help|"
+    r"write|create|generate|translate|fix|debug|"
+    r"kya|kaise|kyun|kab|kahan|kaun|kitna)\b",
+    re.IGNORECASE,
+)
+
+GATE_INSTRUCTION = (
+    "You are a gate in front of a document-based assistant. DEFAULT TO TRUE. "
+    "Answer true if the message can be answered with knowledge, documents or reasoning. "
+    "This includes: questions with or without a question mark; short keyword or topic lookups "
+    "(for example 'refund policy', 'pricing', 'reset password'); commands such as "
+    "'summarize', 'explain', 'compare', 'write', 'translate'; troubleshooting and error messages; "
+    "follow-up messages like 'why?', 'tell me more' or 'and for yearly plan?' when a previous "
+    "assistant message is present; and any non-English or mixed-language query (Hindi, Hinglish). "
+    "Answer false ONLY when the message is purely social or has no informational content: "
+    "greetings, thanks, acknowledgements, farewells, empty text, gibberish, or only punctuation/emojis. "
+    "If you are unsure, answer true."
+)
+
+
+def classify_query(query: str, previous_assistant_message: Optional[str] = None) -> bool:
+    """Return True if the query should be sent to the LLM / RAG pipeline."""
+    q = (query or "").strip()
+
+    # 1. Deterministic rules (free, fast, predictable)
+    if not q:
+        return False
+    if _SOCIAL_ONLY.match(q):
+        logger.info("Query: %r -> skip LLM (rule: social only)", q)
+        return False
+    if "?" in q or _QUESTION_START.match(q) or len(q.split()) >= 6:
+        logger.info("Query: %r -> call LLM (rule: clear question/request)", q)
+        return True
+
+    # 2. Ambiguous cases go to the decision model
     state_context = {
-        "user_query": query,
-        "instruction": (
-            "Decide whether this user query requires calling a large language model "
-            "to generate a meaningful answer. Return true if the query is a real question, "
-            "a complex request, or needs explanation. Return false if it is a single word, "
-            "a greeting, a simple acknowledgement, or does not need an AI-generated answer."
-        )
+        "user_query": q[:MAX_QUERY_CHARS],
+        "previous_assistant_message": (previous_assistant_message or "")[:500],
+        "instruction": GATE_INSTRUCTION,
     }
-    results = router.predict(state=state_context, questions=classifier_questions)
-    noul_score = results.get("answers", {}).get("should_we_call_llm", {}).get("noul", 1.0)
-    logging.warning(f"Query: {query}, noul_score: {noul_score}")
-    return noul_score >= 0.80
 
+    try:
+        results = router.predict(state=state_context, questions=classifier_questions)
+        noul_score = (
+            results.get("answers", {})
+            .get("should_we_call_llm", {})
+            .get("noul", 1.0)   # fail-open: if the score is missing, call the LLM
+        )
+    except Exception:
+        logger.exception("Classifier failed for query %r, failing open", q)
+        return True              # never block a user because the gate crashed
+
+    decision = noul_score >= LLM_THRESHOLD
+    logger.info("Query: %r, noul_score: %.3f, threshold: %.2f, call_llm: %s",
+                q, noul_score, LLM_THRESHOLD, decision)
+    return decision
 def is_harmful_input(query:str) -> bool:
     #check guardrails using laya decision model
     state_context = {
@@ -257,34 +315,33 @@ def is_harmful_input(query:str) -> bool:
     logging.warning(f"Query: {query}, noul_score: {noul_score}")
     return noul_score >= 0.80
 
-def check_cache(query:str):
+def check_cache(query: str):
     cache_index = os.getenv("es_cache_index")
-    search_body ={
+    search_body = {
         "query": {
             "term": {
-            "query.keyword": {
-                "value": query
-            }
+                "query.keyword": {"value": query}
             }
         }
     }
-    es_result = es_client.search(index=cache_index, body= search_body)
-    results = []
-    for hit in es_result['hits']['hits']:
-        results.append({
-            "id": hit['_source'].get('id', ''),
-            "result": hit['_source'].get('answer', '')
-        })
-    
-    return results
+    es_result = es_client.search(index=cache_index, body=search_body)
+    hits = es_result['hits']['hits']
+    if not hits or '_source' not in hits[0]:
+        return None
+    source = hits[0]['_source']
+    answer = source.get('answer')
+    if not answer:
+        return None
+    return {"answer": answer, "sources": source.get('sources', [])}
 
-def save_to_cache(query:str, answer:str):
+def save_to_cache(query: str, answer: str, sources: list):
     cache_index = os.getenv("es_cache_index")
     doc_id = str(uuid.uuid4())
     es_payload = {
         "id": doc_id,
         "query": query,
-        "answer": answer
+        "answer": answer,
+        "sources": sources
     }
     result = es_client.index(index=cache_index, id=doc_id, document=es_payload)
     return result
